@@ -17,8 +17,8 @@
 #define CMD_ERROR 4
 
 // Function prototypes
-int start_server(const char *directory);
+int start_server(const char *directory, const char *bind_ip);
 int list_files(const char *server_ip);
 int get_file(const char *server_ip, const char *filename);
 
-#endif /* CUPID_H */ 
+#endif /* CUPID_H */

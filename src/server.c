@@ -10,10 +10,185 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <ifaddrs.h>
+#include <netdb.h>
 #include "cupid.h"
 
 // Shared directory path
 static char shared_directory[MAX_PATH_LENGTH];
+
+// Function to display server's network interfaces and IP addresses
+void display_server_ip() {
+    struct ifaddrs *ifaddr, *ifa;
+    int family, s;
+    char host[NI_MAXHOST];
+    int found = 0;
+    
+    // Get list of network interfaces
+    if (getifaddrs(&ifaddr) == -1) {
+        perror("Error getting network interfaces");
+        return;
+    }
+    
+    printf("Server IP addresses:\n");
+    
+    // Iterate through interfaces
+    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == NULL)
+            continue;
+            
+        family = ifa->ifa_addr->sa_family;
+        
+        // Only display IPv4 addresses
+        if (family == AF_INET) {
+            s = getnameinfo(ifa->ifa_addr, sizeof(struct sockaddr_in),
+                    host, NI_MAXHOST, NULL, 0, NI_NUMERICHOST);
+            if (s != 0) {
+                printf("Error getting address: %s\n", gai_strerror(s));
+                continue;
+            }
+            
+            // Don't display loopback addresses (127.0.0.1)
+            if (strncmp(host, "127.", 4) == 0)
+                continue;
+                
+            printf("  %s: %s\n", ifa->ifa_name, host);
+            found = 1;
+        }
+    }
+    
+    if (!found) {
+        printf("  No non-loopback IP addresses found.\n");
+        printf("  Server accessible at localhost (127.0.0.1)\n");
+    }
+    
+    freeifaddrs(ifaddr);
+    
+    printf("\nNOTE: If client and server are on different subnets (e.g., 172.x.x.x vs 10.x.x.x),\n");
+    printf("you may need to adjust your network settings. Options include:\n");
+    printf("1. Connect both devices to the same network type (both wired or both wireless)\n");
+    printf("2. Configure your router to allow cross-subnet communication\n");
+    printf("3. Use port forwarding on your router\n");
+}
+
+// Function to check if an IP address exists on any interface
+int ip_exists_on_interface(const char *ip_to_check) {
+    struct ifaddrs *ifaddr, *ifa;
+    int family, s;
+    char host[NI_MAXHOST];
+    int found = 0;
+    
+    // Get list of network interfaces
+    if (getifaddrs(&ifaddr) == -1) {
+        perror("Error getting network interfaces");
+        return 0;
+    }
+    
+    // Iterate through interfaces
+    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == NULL)
+            continue;
+            
+        family = ifa->ifa_addr->sa_family;
+        
+        // Only check IPv4 addresses
+        if (family == AF_INET) {
+            s = getnameinfo(ifa->ifa_addr, sizeof(struct sockaddr_in),
+                    host, NI_MAXHOST, NULL, 0, NI_NUMERICHOST);
+            if (s != 0) {
+                continue;
+            }
+            
+            if (strcmp(host, ip_to_check) == 0) {
+                found = 1;
+                break;
+            }
+        }
+    }
+    
+    freeifaddrs(ifaddr);
+    return found;
+}
+
+// Get best IP to use for binding
+char *get_best_bind_ip() {
+    struct ifaddrs *ifaddr, *ifa;
+    int family, s;
+    char host[NI_MAXHOST];
+    static char best_ip[NI_MAXHOST];
+    best_ip[0] = '\0';
+    
+    // Get list of network interfaces
+    if (getifaddrs(&ifaddr) == -1) {
+        perror("Error getting network interfaces");
+        return NULL;
+    }
+    
+    // First, try to find a 10.x.x.x address (common for local networks)
+    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == NULL)
+            continue;
+            
+        family = ifa->ifa_addr->sa_family;
+        
+        if (family == AF_INET) {
+            s = getnameinfo(ifa->ifa_addr, sizeof(struct sockaddr_in),
+                    host, NI_MAXHOST, NULL, 0, NI_NUMERICHOST);
+            if (s != 0 || strncmp(host, "127.", 4) == 0)
+                continue;
+                
+            if (strncmp(host, "10.", 3) == 0) {
+                strcpy(best_ip, host);
+                break;
+            }
+        }
+    }
+    
+    // If no 10.x.x.x address, try 192.168.x.x
+    if (best_ip[0] == '\0') {
+        for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+            if (ifa->ifa_addr == NULL)
+                continue;
+                
+            family = ifa->ifa_addr->sa_family;
+            
+            if (family == AF_INET) {
+                s = getnameinfo(ifa->ifa_addr, sizeof(struct sockaddr_in),
+                        host, NI_MAXHOST, NULL, 0, NI_NUMERICHOST);
+                if (s != 0 || strncmp(host, "127.", 4) == 0)
+                    continue;
+                    
+                if (strncmp(host, "192.168.", 8) == 0) {
+                    strcpy(best_ip, host);
+                    break;
+                }
+            }
+        }
+    }
+    
+    // If still no IP, use any non-loopback IP
+    if (best_ip[0] == '\0') {
+        for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+            if (ifa->ifa_addr == NULL)
+                continue;
+                
+            family = ifa->ifa_addr->sa_family;
+            
+            if (family == AF_INET) {
+                s = getnameinfo(ifa->ifa_addr, sizeof(struct sockaddr_in),
+                        host, NI_MAXHOST, NULL, 0, NI_NUMERICHOST);
+                if (s != 0 || strncmp(host, "127.", 4) == 0)
+                    continue;
+                    
+                strcpy(best_ip, host);
+                break;
+            }
+        }
+    }
+    
+    freeifaddrs(ifaddr);
+    return best_ip[0] != '\0' ? best_ip : NULL;
+}
 
 // Structure to pass data to client handler thread
 typedef struct {
@@ -153,11 +328,12 @@ void *handle_client(void *arg) {
 }
 
 // Start the file sharing server
-int start_server(const char *directory) {
+int start_server(const char *directory, const char *bind_ip) {
     int server_socket, client_socket;
     struct sockaddr_in server_addr, client_addr;
     socklen_t client_addr_len = sizeof(client_addr);
     pthread_t thread_id;
+    char *auto_bind_ip = NULL;
     
     // Store shared directory
     strncpy(shared_directory, directory, MAX_PATH_LENGTH - 1);
@@ -181,7 +357,50 @@ int start_server(const char *directory) {
     // Prepare server address
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY;
+    
+    // Bind to specific IP if provided, otherwise try to automatically select best IP
+    if (bind_ip != NULL && strlen(bind_ip) > 0) {
+        // Check if the IP address is valid
+        if (inet_pton(AF_INET, bind_ip, &server_addr.sin_addr) <= 0) {
+            fprintf(stderr, "Invalid IP address: %s\n", bind_ip);
+            close(server_socket);
+            return EXIT_FAILURE;
+        }
+        
+        // Check if the IP exists on any interface
+        if (!ip_exists_on_interface(bind_ip)) {
+            fprintf(stderr, "Warning: IP address %s doesn't exist on any network interface.\n", bind_ip);
+            
+            // Try to find the best IP automatically
+            auto_bind_ip = get_best_bind_ip();
+            if (auto_bind_ip != NULL) {
+                fprintf(stderr, "Auto-selecting best IP address: %s\n", auto_bind_ip);
+                if (inet_pton(AF_INET, auto_bind_ip, &server_addr.sin_addr) <= 0) {
+                    fprintf(stderr, "Error with auto-selected IP. Falling back to INADDR_ANY\n");
+                    server_addr.sin_addr.s_addr = INADDR_ANY;
+                }
+            } else {
+                fprintf(stderr, "Could not auto-select IP. Falling back to INADDR_ANY\n");
+                server_addr.sin_addr.s_addr = INADDR_ANY;
+            }
+        } else {
+            printf("Binding to specific IP address: %s\n", bind_ip);
+        }
+    } else {
+        // Try to auto-select best IP
+        auto_bind_ip = get_best_bind_ip();
+        if (auto_bind_ip != NULL) {
+            printf("Auto-selecting best IP address: %s\n", auto_bind_ip);
+            if (inet_pton(AF_INET, auto_bind_ip, &server_addr.sin_addr) <= 0) {
+                fprintf(stderr, "Error with auto-selected IP. Falling back to INADDR_ANY\n");
+                server_addr.sin_addr.s_addr = INADDR_ANY;
+            }
+        } else {
+            server_addr.sin_addr.s_addr = INADDR_ANY;
+            printf("Binding to all available interfaces (INADDR_ANY)\n");
+        }
+    }
+    
     server_addr.sin_port = htons(CUPID_PORT);
     
     // Bind socket
@@ -199,6 +418,7 @@ int start_server(const char *directory) {
     }
     
     printf("Cupid server started. Sharing directory: %s\n", shared_directory);
+    display_server_ip();
     printf("Listening on port %d...\n", CUPID_PORT);
     
     // Accept client connections

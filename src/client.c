@@ -7,12 +7,87 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <ifaddrs.h>
+#include <netdb.h>
 #include "cupid.h"
 
-// Connect to a server
+// Function to determine if IPs are on the same subnet
+int is_same_subnet(const char *ip1, const char *ip2, const char *mask) {
+    struct in_addr addr1, addr2, netmask;
+    
+    if (inet_pton(AF_INET, ip1, &addr1) <= 0 ||
+        inet_pton(AF_INET, ip2, &addr2) <= 0 ||
+        inet_pton(AF_INET, mask, &netmask) <= 0) {
+        return 0; // Error in conversion
+    }
+    
+    // Compare network portions
+    return ((addr1.s_addr & netmask.s_addr) == (addr2.s_addr & netmask.s_addr));
+}
+
+// Get local IP that's on the same subnet as the target IP
+char *get_matching_local_ip(const char *target_ip) {
+    struct ifaddrs *ifaddr, *ifa;
+    int family, s;
+    char host[NI_MAXHOST];
+    static char matching_ip[NI_MAXHOST];
+    matching_ip[0] = '\0';
+    
+    // Determine target subnet
+    char first_octet[4];
+    strncpy(first_octet, target_ip, 3);
+    first_octet[3] = '\0';
+    
+    // Get list of network interfaces
+    if (getifaddrs(&ifaddr) == -1) {
+        perror("Error getting network interfaces");
+        return NULL;
+    }
+    
+    // Iterate through interfaces
+    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == NULL)
+            continue;
+        
+        family = ifa->ifa_addr->sa_family;
+        
+        // Only check IPv4 addresses
+        if (family == AF_INET) {
+            s = getnameinfo(ifa->ifa_addr, sizeof(struct sockaddr_in),
+                    host, NI_MAXHOST, NULL, 0, NI_NUMERICHOST);
+            if (s != 0) {
+                continue;
+            }
+            
+            // Skip loopback addresses
+            if (strncmp(host, "127.", 4) == 0)
+                continue;
+            
+            // Check if this interface is on the same subnet as target
+            if (is_same_subnet(host, target_ip, "255.255.0.0") || 
+                strncmp(host, first_octet, strlen(first_octet)) == 0) {
+                strcpy(matching_ip, host);
+                break;
+            }
+            
+            // If we haven't found a match yet, store this as a potential match
+            if (matching_ip[0] == '\0') {
+                strcpy(matching_ip, host);
+            }
+        }
+    }
+    
+    freeifaddrs(ifaddr);
+    return matching_ip[0] != '\0' ? matching_ip : NULL;
+}
+
+// Connect to a server with intelligent routing
 int connect_to_server(const char *server_ip) {
     int client_socket;
-    struct sockaddr_in server_addr;
+    struct sockaddr_in server_addr, client_addr;
+    char *local_ip;
+    
+    printf("Connecting to server at %s:%d...\n", server_ip, CUPID_PORT);
     
     // Create socket
     client_socket = socket(AF_INET, SOCK_STREAM, 0);
@@ -33,14 +108,58 @@ int connect_to_server(const char *server_ip) {
         return -1;
     }
     
-    // Connect to server
-    if (connect(client_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) == -1) {
-        perror("Connection failed");
-        close(client_socket);
-        return -1;
+    // Try direct connection first
+    if (connect(client_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) != -1) {
+        printf("Connected directly to server\n");
+        return client_socket;
     }
     
-    return client_socket;
+    // If direct connection fails, try to find a matching local IP
+    local_ip = get_matching_local_ip(server_ip);
+    if (local_ip != NULL) {
+        printf("Direct connection failed. Trying with local IP %s...\n", local_ip);
+        
+        // Close the previous socket and create a new one
+        close(client_socket);
+        client_socket = socket(AF_INET, SOCK_STREAM, 0);
+        if (client_socket == -1) {
+            perror("Error creating socket");
+            return -1;
+        }
+        
+        // Bind to the specific local IP
+        memset(&client_addr, 0, sizeof(client_addr));
+        client_addr.sin_family = AF_INET;
+        client_addr.sin_port = 0; // Let the OS choose a port
+        if (inet_pton(AF_INET, local_ip, &client_addr.sin_addr) <= 0) {
+            fprintf(stderr, "Invalid local address: %s\n", local_ip);
+            close(client_socket);
+            return -1;
+        }
+        
+        if (bind(client_socket, (struct sockaddr *)&client_addr, sizeof(client_addr)) == -1) {
+            perror("Failed to bind to local address");
+            close(client_socket);
+            return -1;
+        }
+        
+        // Try to connect again with bound socket
+        if (connect(client_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) != -1) {
+            printf("Connected to server using local IP %s\n", local_ip);
+            return client_socket;
+        }
+    }
+    
+    // If we're here, both connection attempts failed
+    perror("Connection failed");
+    fprintf(stderr, "Could not connect to server at %s:%d\n", server_ip, CUPID_PORT);
+    fprintf(stderr, "Possible solutions:\n");
+    fprintf(stderr, "1. Make sure server and client are on the same network or can route to each other\n");
+    fprintf(stderr, "2. Check if server is running and bound to the correct IP\n");
+    fprintf(stderr, "3. Check if any firewall is blocking the connection\n");
+    
+    close(client_socket);
+    return -1;
 }
 
 // List files available on server
