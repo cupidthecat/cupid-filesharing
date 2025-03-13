@@ -17,6 +17,52 @@
 // Shared directory path
 static char shared_directory[MAX_PATH_LENGTH];
 
+// Function to extract network portion of an IP
+void get_network_address(const char *ip_address, char *network, const char *netmask) {
+    struct in_addr ip, mask, net;
+    
+    if (inet_pton(AF_INET, ip_address, &ip) <= 0 ||
+        inet_pton(AF_INET, netmask, &mask) <= 0) {
+        // Error in conversion
+        strcpy(network, "0.0.0.0");
+        return;
+    }
+    
+    // Calculate network address
+    net.s_addr = ip.s_addr & mask.s_addr;
+    
+    // Convert back to string
+    inet_ntop(AF_INET, &net, network, INET_ADDRSTRLEN);
+}
+
+// Add routing table entry for cross-subnet communication
+int add_route(const char *target_network, const char *netmask, const char *gateway) {
+    char cmd[256];
+    int result;
+    
+    // Check if running as root
+    if (geteuid() != 0) {
+        fprintf(stderr, "Warning: Adding routes requires root privileges.\n");
+        fprintf(stderr, "To add route manually: sudo ip route add %s/%s via %s\n", 
+                target_network, netmask, gateway);
+        return -1;
+    }
+    
+    // Prepare and execute route command
+    snprintf(cmd, sizeof(cmd), "ip route add %s/%s via %s 2>/dev/null", 
+             target_network, netmask, gateway);
+    result = system(cmd);
+    
+    if (result != 0) {
+        // Route might already exist or other error
+        fprintf(stderr, "Note: Route may already exist or could not be added.\n");
+        return -1;
+    }
+    
+    printf("Added route to %s/%s via %s\n", target_network, netmask, gateway);
+    return 0;
+}
+
 // Function to display server's network interfaces and IP addresses
 void display_server_ip() {
     struct ifaddrs *ifaddr, *ifa;
@@ -294,9 +340,36 @@ void *handle_client(void *arg) {
     struct sockaddr_in client_addr = client_data->client_addr;
     char buffer[MAX_PACKET_SIZE];
     ssize_t bytes_received;
+    char client_ip[INET_ADDRSTRLEN];
+    char server_ip[INET_ADDRSTRLEN];
+    char client_network[INET_ADDRSTRLEN];
+    char server_network[INET_ADDRSTRLEN];
+    struct sockaddr_in local_addr;
+    socklen_t addr_len = sizeof(local_addr);
     
-    printf("Client connected from %s:%d\n", 
-           inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
+    // Get client IP
+    inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
+    
+    // Get server's local IP for this connection
+    if (getsockname(client_socket, (struct sockaddr*)&local_addr, &addr_len) == 0) {
+        inet_ntop(AF_INET, &local_addr.sin_addr, server_ip, INET_ADDRSTRLEN);
+    } else {
+        strcpy(server_ip, "unknown");
+    }
+    
+    printf("Client connected from %s:%d\n", client_ip, ntohs(client_addr.sin_port));
+    
+    // Check if on different subnets and try to add routes if needed
+    get_network_address(client_ip, client_network, "255.255.0.0");
+    get_network_address(server_ip, server_network, "255.255.0.0");
+    
+    if (strcmp(client_network, server_network) != 0) {
+        printf("Client is on a different subnet (%s vs %s)\n", 
+               client_network, server_network);
+        
+        // Try to add a route to the client's network
+        add_route(client_network, "16", client_ip);
+    }
     
     // Receive command from client
     bytes_received = recv(client_socket, buffer, sizeof(buffer), 0);
@@ -322,8 +395,7 @@ void *handle_client(void *arg) {
     
     close(client_socket);
     free(client_data);
-    printf("Client disconnected from %s:%d\n", 
-           inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
+    printf("Client disconnected from %s:%d\n", client_ip, ntohs(client_addr.sin_port));
     return NULL;
 }
 
